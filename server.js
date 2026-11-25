@@ -108,9 +108,18 @@ function send(uid, o) { const c = conns.get(uid); if (c) c.send(JSON.stringify(o
 const toast = (uid, msg) => send(uid, { t: 'toast', msg });
 const err = (uid, msg) => send(uid, { t: 'error', msg });
 
+// ---------- pontos da ranqueada e OVERALL ----------
+// vitória +100, empate +50, derrota -100 (nunca abaixo de 0). Todo jogador novo começa com OVR 60;
+// a cada PTS_PER_OVR pontos o OVR sobe 1, até 99.
+const PTS_WIN = 100, PTS_DRAW = 50, PTS_LOSS = 100, PTS_PER_OVR = 200, OVR_MIN = 60, OVR_MAX = 99;
+const ovrOf = u => Math.min(OVR_MAX, OVR_MIN + Math.floor(Math.max(0, u.rating || 0) / PTS_PER_OVR));
+if (db.ptsSystem !== 2) { // sistema antigo (Elo começando em 1000): todo mundo volta para 0 pontos
+  for (const id in db.users) db.users[id].rating = 0;
+  db.ptsSystem = 2;
+}
 function pub(u) {
   const club = u.clubId && db.clubs[u.clubId];
-  return { id: u.id, name: u.name, rating: Math.round(u.rating), w: u.w, d: u.d, l: u.l, games: u.games, club: club ? club.name : null };
+  return { id: u.id, name: u.name, rating: Math.round(u.rating), ovr: ovrOf(u), w: u.w, d: u.d, l: u.l, games: u.games, goals: u.goals || 0, club: club ? club.name : null };
 }
 const meMsg = u => ({ t: 'me', me: Object.assign(pub(u), { nextNameChange: u.nameChangedAt + NAME_WAIT, pos: u.pos, num: u.num }) });
 function friendsMsg(u) {
@@ -123,13 +132,23 @@ function friendsMsg(u) {
 }
 function clubMsg(u) {
   const c = u.clubId && db.clubs[u.clubId];
-  return { t: 'club', club: c ? { id: c.id, name: c.name, color: c.color, owner: c.owner, members: c.members.map(id => db.users[id]).filter(Boolean).map(m => Object.assign(pub(m), { online: conns.has(m.id) })) } : null };
+  return { t: 'club', club: c ? Object.assign(clubPub(c), { owner: c.owner, lobby: lobbyOf.get(u.id) || null, members: c.members.map(id => db.users[id]).filter(Boolean).map(m => Object.assign(pub(m), { online: conns.has(m.id), pos: m.pos || 'MEI', num: m.num || 10, inLobby: !!(clubLobby(c.id) && clubLobby(c.id).members.some(x => x.id === m.id)) })) }) : null };
+}
+function clubPub(c) {
+  const ms = c.members.map(id => db.users[id]).filter(Boolean);
+  const ovr = ms.length ? Math.round(ms.reduce((a, m) => a + ovrOf(m), 0) / ms.length) : OVR_MIN;
+  return { id: c.id, name: c.name, color: c.color, pts: c.pts || 0, w: c.w || 0, d: c.d || 0, l: c.l || 0, games: c.games || 0, goals: c.goals || 0, ga: c.ga || 0, ovr, size: c.members.length };
+}
+// sala do clube (uma por clube): os membros entram nela para jogar a ranqueada de clubes
+function clubLobby(cid) {
+  for (const l of lobbies.values()) if (l.mode === 'club' && l.clubId === cid) return l;
+  return null;
 }
 function lobbyMsg(l) {
   return {
     t: 'lobby', lobby: l ? {
-      code: l.code, mode: l.mode, host: l.host, status: l.status, settings: l.settings,
-      members: l.members.map(m => { const u = db.users[m.id]; return { id: m.id, name: u ? u.name : '?', side: m.side, pos: m.pos, rating: u ? Math.round(u.rating) : 1000 }; }),
+      code: l.code, mode: l.mode, clubId: l.clubId || null, host: l.host, status: l.status, settings: l.settings,
+      members: l.members.map(m => { const u = db.users[m.id]; return { id: m.id, name: u ? u.name : '?', side: m.side, pos: m.pos, rating: u ? Math.round(u.rating) : 0, ovr: u ? ovrOf(u) : OVR_MIN, num: u ? u.num : 10 }; }),
     } : null,
   };
 }
@@ -152,6 +171,7 @@ function leaveLobby(uid) {
     if (l.status === 'queue') l.status = 'lobby';
     if (!l.members.length) lobbies.delete(code);
     else { if (l.host === uid) l.host = l.members[0].id; pushLobby(l); }
+    if (l.mode === 'club') pushClub(l.clubId);
   }
   send(uid, lobbyMsg(null));
 }
@@ -159,14 +179,16 @@ function joinLobby(uid, l) {
   if (lobbyOf.get(uid) === l.code) return;
   if (matchOf.has(uid)) return err(uid, 'Você está numa partida.');
   if (l.status !== 'lobby') return err(uid, 'Essa sala já está jogando ou procurando partida.');
-  const maxPlayers = l.mode === 'ranked' ? 7 : 14;
+  if (l.mode === 'club' && db.users[uid].clubId !== l.clubId) return err(uid, 'Essa sala é só para jogadores do time.');
+  const maxPlayers = l.mode === 'custom' ? 14 : 7;
   if (l.members.length >= maxPlayers) return err(uid, 'A sala está cheia.');
   leaveLobby(uid);
   const u = db.users[uid];
-  const side = l.mode === 'ranked' ? 0 : (l.members.filter(m => m.side === 0).length <= l.members.filter(m => m.side === 1).length ? 0 : 1);
+  const side = l.mode !== 'custom' ? 0 : (l.members.filter(m => m.side === 0).length <= l.members.filter(m => m.side === 1).length ? 0 : 1);
   l.members.push({ id: uid, side, pos: u.pos || 'MEI' });
   lobbyOf.set(uid, l.code);
   pushLobby(l);
+  if (l.mode === 'club') pushClub(l.clubId);
 }
 function sideInfo(humans, s, avoidColor, avoidName) {
   const h = humans.find(x => x.side === s), u = h && db.users[h.id];
@@ -176,18 +198,24 @@ function sideInfo(humans, s, avoidColor, avoidName) {
   if (!color || color === avoidColor) color = PAL.find(c => c !== avoidColor && (s === 0 ? true : c !== '#f1f5f9')) || PAL[1];
   return { name: club ? club.name : (u ? 'Time de ' + u.name : (s ? 'Visitantes' : 'Mandantes')), color };
 }
-function startMatch(humans, hostId, ranked, settings, lobbyCodes) {
+function startMatch(humans, hostId, ranked, settings, lobbyCodes, clubs) {
   const id = crypto.randomBytes(6).toString('hex');
-  const s0 = sideInfo(humans, 0, null, null), s1 = sideInfo(humans, 1, s0.color, s0.name);
-  const m = { id, host: hostId, members: humans.map(h => h.id), humans, ranked, lobbies: lobbyCodes, ended: false };
+  let s0 = sideInfo(humans, 0, null, null), s1 = sideInfo(humans, 1, s0.color, s0.name);
+  if (clubs) { // ranqueada de clubes: nome e cor de cada clube
+    const c0 = db.clubs[clubs[0]], c1 = db.clubs[clubs[1]];
+    if (c0) s0 = { name: c0.name, color: c0.color };
+    if (c1) s1 = { name: c1.name, color: c1.color === s0.color ? (PAL.find(c => c !== s0.color) || PAL[1]) : c1.color };
+  }
+  const m = { id, host: hostId, members: humans.map(h => h.id), humans, ranked, clubs: clubs || null, lobbies: lobbyCodes, ended: false };
   matches.set(id, m);
   for (const h of humans) matchOf.set(h.id, id);
   for (const c of lobbyCodes) { const l = lobbies.get(c); if (l) { l.status = 'playing'; pushLobby(l); } }
   const payload = {
     t: 'matchStart', matchId: id, hostId, ranked, settings, sides: [s0, s1],
-    humans: humans.map(h => { const u = db.users[h.id]; return { id: h.id, team: h.side, pos: h.pos, name: u.name, num: u.num, look: u.look }; }),
+    humans: humans.map(h => { const u = db.users[h.id]; return { id: h.id, team: h.side, pos: h.pos, name: u.name, num: u.num, look: u.look, ovr: ovrOf(u) }; }),
   };
   for (const h of humans) { send(h.id, payload); pushFriendsOf(h.id); }
+  return m;
 }
 function finishMatch(m) {
   m.ended = true; matches.delete(m.id);
@@ -198,27 +226,33 @@ function finishMatch(m) {
 }
 function tryMatchmaking() {
   queue = queue.filter(c => lobbies.has(c) && lobbies.get(c).status === 'queue');
-  while (queue.length >= 2) {
-    const a = lobbies.get(queue.shift()), b = lobbies.get(queue.shift());
-    const humans = [...a.members.map(m => ({ id: m.id, side: 0, pos: m.pos })), ...b.members.map(m => ({ id: m.id, side: 1, pos: m.pos }))];
-    startMatch(humans, a.host, true, { dur: 300, diff: 'normal' }, [a.code, b.code]);
+  for (const mode of ['ranked', 'club']) {
+    let list = queue.filter(c => lobbies.get(c).mode === mode);
+    while (list.length >= 2) {
+      const a = lobbies.get(list[0]);
+      const bi = list.findIndex((c, i) => i > 0 && (mode !== 'club' || lobbies.get(c).clubId !== a.clubId));
+      if (bi < 0) break;
+      const b = lobbies.get(list[bi]);
+      list = list.filter(c => c !== a.code && c !== b.code);
+      queue = queue.filter(c => c !== a.code && c !== b.code);
+      const humans = [...a.members.map(m => ({ id: m.id, side: 0, pos: m.pos })), ...b.members.map(m => ({ id: m.id, side: 1, pos: m.pos }))];
+      const m = startMatch(humans, a.host, true, { dur: 300, diff: 'normal' }, [a.code, b.code], mode === 'club' ? [a.clubId, b.clubId] : null);
+    }
   }
 }
 function applyElo(m, sc) {
   const sides = [0, 1].map(s => m.humans.filter(h => h.side === s).map(h => db.users[h.id]).filter(Boolean));
   const changes = {};
   if (!sides[0].length || !sides[1].length) return changes;
-  const avg = list => list.reduce((a, u) => a + u.rating, 0) / list.length;
-  const e0 = 1 / (1 + Math.pow(10, (avg(sides[1]) - avg(sides[0])) / 400));
   const s0 = sc[0] > sc[1] ? 1 : sc[0] < sc[1] ? 0 : 0.5;
   sides.forEach((list, s) => {
-    const S = s === 0 ? s0 : 1 - s0, E = s === 0 ? e0 : 1 - e0;
-    const delta = Math.round(32 * (S - E) + (S === 1 ? Math.min(3, Math.abs(sc[0] - sc[1])) : 0));
+    const S = s === 0 ? s0 : 1 - s0;
+    const delta = S === 1 ? PTS_WIN : S === 0 ? -PTS_LOSS : PTS_DRAW;
     for (const u of list) {
-      const old = Math.round(u.rating);
+      const old = Math.round(u.rating), oldOvr = ovrOf(u);
       u.rating = Math.max(0, u.rating + delta); u.games++;
       if (S === 1) u.w++; else if (S === 0) u.l++; else u.d++;
-      changes[u.id] = { old, now: Math.round(u.rating) };
+      changes[u.id] = { old, now: Math.round(u.rating), ovrOld: oldOvr, ovr: ovrOf(u) };
     }
   });
   save();
@@ -245,7 +279,7 @@ function handle(c, msg) {
     if (!u) {
       const id = newId();
       token = crypto.randomBytes(16).toString('hex');
-      u = { id, name: clean(msg.name, 14) || 'Jogador', nameChangedAt: Date.now(), created: Date.now(), rating: 1000, w: 0, d: 0, l: 0, games: 0, friends: [], reqIn: [], clubId: null, clubInv: [] };
+      u = { id, name: clean(msg.name, 14) || 'Jogador', nameChangedAt: Date.now(), created: Date.now(), rating: 0, w: 0, d: 0, l: 0, games: 0, friends: [], reqIn: [], clubId: null, clubInv: [] };
       db.users[id] = u; db.tokens[token] = id;
     }
     if (msg.look && typeof msg.look === 'object') u.look = msg.look;
@@ -353,6 +387,20 @@ function handle(c, msg) {
       joinLobby(uid, l);
       break;
     }
+    case 'clubLobby': { // entra na sala do seu clube (cria se ninguém criou)
+      const club = u.clubId && db.clubs[u.clubId];
+      if (!club) return err(uid, 'Você não tem time.');
+      if (matchOf.has(uid)) return;
+      let l = clubLobby(club.id);
+      if (!l) { leaveLobby(uid); l = { code: newCode(), mode: 'club', clubId: club.id, host: uid, members: [], settings: { dur: 300, diff: 'normal' }, status: 'lobby' }; lobbies.set(l.code, l); }
+      joinLobby(uid, l); pushClub(club.id);
+      break;
+    }
+    case 'topClubs': {
+      const list = Object.values(db.clubs).filter(c => (c.games || 0) > 0).sort((a, b) => (b.pts || 0) - (a.pts || 0) || (b.goals || 0) - (a.goals || 0)).slice(0, 100).map(clubPub);
+      send(uid, { t: 'topClubs', list });
+      break;
+    }
     case 'lobbyJoin': {
       const l = lobbies.get(clean(msg.code, 5).toUpperCase());
       if (!l) return err(uid, 'Sala não encontrada. Confira o código.');
@@ -385,7 +433,7 @@ function handle(c, msg) {
       startMatch(myLobby.members.map(m => ({ id: m.id, side: m.side, pos: m.pos })), uid, false, Object.assign({}, myLobby.settings), [myLobby.code]);
       break;
     case 'queueStart':
-      if (!myLobby || myLobby.host !== uid || myLobby.mode !== 'ranked' || myLobby.status !== 'lobby') return;
+      if (!myLobby || myLobby.host !== uid || myLobby.mode === 'custom' || myLobby.status !== 'lobby') return;
       myLobby.status = 'queue'; queue.push(myLobby.code); pushLobby(myLobby); tryMatchmaking();
       break;
     case 'queueCancel':
@@ -405,8 +453,23 @@ function handle(c, msg) {
       if (!m || m.host !== uid || m.ended) return;
       const sc = Array.isArray(msg.sc) ? [parseInt(msg.sc[0]) || 0, parseInt(msg.sc[1]) || 0] : [0, 0];
       const changes = m.ranked ? applyElo(m, sc) : {};
-      for (const h of m.humans) { send(h.id, { t: 'matchResult', ranked: m.ranked, changes, sc }); if (db.users[h.id]) send(h.id, meMsg(db.users[h.id])); }
+      if (m.ranked) { // gols nas ranqueadas
+        const g = msg.goals && typeof msg.goals === 'object' ? msg.goals : {};
+        for (const h of m.humans) { const n = Math.max(0, Math.min(30, parseInt(g[h.id]) || 0)); if (n && db.users[h.id]) db.users[h.id].goals = (db.users[h.id].goals || 0) + n; }
+      }
+      if (m.ranked && m.clubs) m.clubs.forEach((cid, s) => { // ranqueada de clubes
+        const c = db.clubs[cid]; if (!c) return;
+        const mine = sc[s], theirs = sc[1 - s];
+        const d = mine > theirs ? PTS_WIN : mine < theirs ? -PTS_LOSS : PTS_DRAW;
+        c.pts = Math.max(0, (c.pts || 0) + d); c.games = (c.games || 0) + 1;
+        if (mine > theirs) c.w = (c.w || 0) + 1; else if (mine < theirs) c.l = (c.l || 0) + 1; else c.d = (c.d || 0) + 1;
+        c.goals = (c.goals || 0) + mine; c.ga = (c.ga || 0) + theirs;
+        changes['club_' + s] = { name: c.name, delta: d, now: c.pts };
+      });
+      save();
+      for (const h of m.humans) { send(h.id, { t: 'matchResult', ranked: m.ranked, club: !!m.clubs, changes, sc }); if (db.users[h.id]) send(h.id, meMsg(db.users[h.id])); }
       finishMatch(m);
+      if (m.clubs) for (const cid of m.clubs) pushClub(cid);
       break;
     }
     case 'leaveMatch': leaveMatch(uid); break;
