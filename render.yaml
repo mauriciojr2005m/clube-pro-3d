@@ -1,0 +1,9 @@
+# Configuração para hospedar o servidor online do Clube Pro 3D de graça no Render (render.com)
+services:
+  - type: web
+    name: clube-pro-3d
+    runtime: node
+    plan: free
+    buildCommand: "echo sem dependencias"
+    startCommand: "node server.js"
+    healthCheckPath: /saude

@@ -1,0 +1,12 @@
+{
+  "name": "clube-pro-3d",
+  "version": "1.0.0",
+  "description": "Servidor online do Clube Pro 3D",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
